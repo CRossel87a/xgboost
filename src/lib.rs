@@ -1,10 +1,13 @@
 use rand::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::f64;
 use rayon::prelude::*;
-
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+use anyhow::{Result, Context};
 
 /// The training objective for XGBoost-style gradient boosting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum XGBObjective {
     /// Regression with squared error loss:
     ///   gradient = (pred - label)
@@ -17,7 +20,7 @@ pub enum XGBObjective {
 }
 
 /// Configuration parameters for an XGBoost-like model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XGBConfig {
     /// Number of boosting rounds.
     pub n_estimators: usize,
@@ -42,7 +45,7 @@ pub struct XGBConfig {
 }
 
 /// A minimal XGBoost-inspired gradient boosting model for either regression or binary logistic.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct XGBoostModel {
     /// The objective function (determines gradients/hessians).
     pub objective: XGBObjective,
@@ -55,7 +58,7 @@ pub struct XGBoostModel {
 }
 
 /// A single regression tree node storing split structure or a leaf value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum XGBTreeNode {
     /// Leaf node with a constant weight (score) contribution.
     Leaf(f64),
@@ -70,7 +73,7 @@ enum XGBTreeNode {
 
 /// A CART-style regression tree used by XGBoost, storing node splits with
 /// second-order statistics to guide splitting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XGBTree {
     root: XGBTreeNode,
 }
@@ -221,6 +224,20 @@ impl XGBoostModel {
     /// Predict multiple samples at once.
     pub fn predict_batch(&self, data: &[Vec<f64>]) -> Vec<f64> {
         data.iter().map(|row| self.predict_one(row)).collect()
+    }
+
+    pub fn save_model(&self, path: &str) -> Result<()> {
+        let file = File::create(path).context("Failed to create model file")?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer(writer, self).context("Failed to serialize model")?;
+        Ok(())
+    }
+
+    pub fn load_model(path: &str) -> Result<Self> {
+        let file = File::open(path).context("Failed to open model file")?;
+        let reader = BufReader::new(file);
+        let model = serde_json::from_reader(reader).context("Failed to deserialize model")?;
+        Ok(model)
     }
 }
 
