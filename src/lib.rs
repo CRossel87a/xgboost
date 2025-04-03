@@ -1,9 +1,13 @@
 use rand::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::f64;
-
+use rayon::prelude::*;
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+use anyhow::{Result, Context};
 
 /// The training objective for XGBoost-style gradient boosting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum XGBObjective {
     /// Regression with squared error loss:
     ///   gradient = (pred - label)
@@ -16,7 +20,7 @@ pub enum XGBObjective {
 }
 
 /// Configuration parameters for an XGBoost-like model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XGBConfig {
     /// Number of boosting rounds.
     pub n_estimators: usize,
@@ -41,7 +45,7 @@ pub struct XGBConfig {
 }
 
 /// A minimal XGBoost-inspired gradient boosting model for either regression or binary logistic.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct XGBoostModel {
     /// The objective function (determines gradients/hessians).
     pub objective: XGBObjective,
@@ -54,7 +58,7 @@ pub struct XGBoostModel {
 }
 
 /// A single regression tree node storing split structure or a leaf value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum XGBTreeNode {
     /// Leaf node with a constant weight (score) contribution.
     Leaf(f64),
@@ -69,7 +73,7 @@ enum XGBTreeNode {
 
 /// A CART-style regression tree used by XGBoost, storing node splits with
 /// second-order statistics to guide splitting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XGBTree {
     root: XGBTreeNode,
 }
@@ -140,28 +144,33 @@ impl XGBoostModel {
         self.trees.clear();
 
         for _round in 0..self.config.n_estimators {
-            // 1) compute grad, hess
+            // 1) compute grad, hess (Parallelized)
             let (grad, hess) = match self.objective {
                 XGBObjective::RegSquareError => {
                     // gradient = (pred - y), hessian = 1
-                    let mut g = vec![0.0; n];
-                    let hh = vec![1.0; n];
-                    for i in 0..n {
-                        g[i] = preds[i] - y[i];
-                    }
+                    let g: Vec<f64> = (0..n)
+                        .into_par_iter()
+                        .map(|i| preds[i] - y[i])
+                        .collect();
+                    let hh = vec![1.0; n]; // Hessian is constant
                     (g, hh)
                 }
                 XGBObjective::BinaryLogistic => {
                     // p = sigmoid(pred)
                     // gradient = p - label
                     // hessian = p*(1-p)
-                    let mut g = vec![0.0; n];
-                    let mut hh = vec![0.0; n];
-                    for i in 0..n {
-                        let p = 1.0 / (1.0 + (-preds[i]).exp());
-                        g[i] = p - y[i];
-                        hh[i] = p * (1.0 - p);
-                    }
+                    let results: Vec<(f64, f64)> = (0..n)
+                        .into_par_iter()
+                        .map(|i| {
+                            let p = 1.0 / (1.0 + (-preds[i]).exp());
+                            let g_i = p - y[i];
+                            let h_i = p * (1.0 - p);
+                            (g_i, h_i)
+                        })
+                        .collect();
+
+                    let g: Vec<f64> = results.par_iter().map(|(g_i, _)| *g_i).collect();
+                    let hh: Vec<f64> = results.par_iter().map(|(_, h_i)| *h_i).collect();
                     (g, hh)
                 }
             };
@@ -178,15 +187,16 @@ impl XGBoostModel {
             // 3) build a tree
             let tree = build_xgb_tree(x, &grad, &hess, &sample_mask, &col_mask, &self.config, 0);
             // 4) append the tree
-            self.trees.push(XGBTree { root: tree.clone() });
+            let tree_node = tree.clone(); // Clone for prediction update
+            self.trees.push(XGBTree { root: tree });
 
-            // 5) update preds: F_m = F_{m-1} + eta * Tree
-            for i in 0..n {
+            // 5) update preds: F_m = F_{m-1} + eta * Tree (Parallelized)
+            preds.par_iter_mut().enumerate().for_each(|(i, pred)| {
                 if sample_mask[i] {
-                    let incr = traverse(&tree, &x[i]) * self.config.learning_rate;
-                    preds[i] += incr;
+                    let incr = traverse(&tree_node, &x[i]) * self.config.learning_rate;
+                    *pred += incr;
                 }
-            }
+            });
         }
     }
 
@@ -214,6 +224,20 @@ impl XGBoostModel {
     /// Predict multiple samples at once.
     pub fn predict_batch(&self, data: &[Vec<f64>]) -> Vec<f64> {
         data.iter().map(|row| self.predict_one(row)).collect()
+    }
+
+    pub fn save_model(&self, path: &str) -> Result<()> {
+        let file = File::create(path).context("Failed to create model file")?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer(writer, self).context("Failed to serialize model")?;
+        Ok(())
+    }
+
+    pub fn load_model(path: &str) -> Result<Self> {
+        let file = File::open(path).context("Failed to open model file")?;
+        let reader = BufReader::new(file);
+        let model = serde_json::from_reader(reader).context("Failed to deserialize model")?;
+        Ok(model)
     }
 }
 
@@ -329,13 +353,11 @@ fn build_xgb_tree(
 /// Find the best split over the allowed columns.
 /// We compute approximate gain using G = sum(grad), H = sum(hess) for left/right subsets.
 fn find_best_xgb_split(params: SplitParams) -> Option<XGBNodeSplit> {
-    let mut best: Option<XGBNodeSplit> = None;
     let base_score = calc_gain(params.g_node, params.h_node, params.lambda, params.alpha);
 
-    // For each feature
-    for (feat_idx, &use_col) in params.col_mask.iter().enumerate() {
-        if !use_col {
-            continue;
+    let best_split_for_feature = |feat_idx: usize| -> Option<XGBNodeSplit> {
+        if !params.col_mask[feat_idx] {
+            return None;
         }
 
         let split_params = SplitParams {
@@ -352,16 +374,15 @@ fn find_best_xgb_split(params: SplitParams) -> Option<XGBNodeSplit> {
             col_mask: params.col_mask,
         };
 
-        if let Some(split) =
-            find_best_split_for_feature(split_params, base_score, params.min_child_weight)
-        {
-            if best.is_none() || split.gain > best.as_ref().unwrap().gain {
-                best = Some(split);
-            }
-        }
-    }
+        find_best_split_for_feature(split_params, base_score, params.min_child_weight)
+    };
 
-    best
+
+    // Parallelize search over features using filter_map and max_by
+    (0..params.col_mask.len())
+        .into_par_iter()
+        .filter_map(best_split_for_feature)
+        .max_by(|a, b| a.gain.partial_cmp(&b.gain).unwrap_or(std::cmp::Ordering::Equal))
 }
 
 fn find_best_split_for_feature(
